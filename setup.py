@@ -1,13 +1,13 @@
 from distutils.core import setup
 
 setup(
-    name = "django-redis-cache",
-    url = "http://github.com/sebleier/django-redis-cache/",
+    name = "django-dredis-cache",
+    url = "http://github.com/sebleier/django-dredis-cache/",
     author = "Sean Bleier",
     author_email = "sebleier@gmail.com",
-    version = "0.5.0",
-    packages = ["redis_cache"],
-    description = "Redis Cache Backend for Django",
+    version = "1.3.0a",
+    packages = ["dredis_cache"],
+    description = "A distributed Redis cache backend for Django",
     classifiers = [
         "Programming Language :: Python",
         "Operating System :: OS Independent",

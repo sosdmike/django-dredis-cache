@@ -11,7 +11,7 @@ from django import VERSION
 from django.core.cache import get_cache
 from models import Poll, expensive_calculation
 from random import random
-from redis_cache.cache import RedisCache
+from dredis_cache.cache import RedisCache
 
 # functions/classes for complex data type tests
 def f():
