@@ -80,7 +80,7 @@ class CacheSharder(object):
 
     def remove(self, server):
         """
-        Removes a node from the ring using the id.
+        Removes a node using the id.
 
         Finds adjacent intervals and combines them before removing node from
         the
