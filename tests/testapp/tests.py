@@ -10,6 +10,7 @@ except ImportError:
 from django import VERSION
 from django.core.cache import get_cache
 from models import Poll, expensive_calculation
+from random import random
 from redis_cache.cache import RedisCache
 
 # functions/classes for complex data type tests
@@ -18,6 +19,15 @@ def f():
 class C:
     def m(n):
         return 24
+
+def stdev(sequence):
+    if len(sequence) < 1:
+        return None
+    else:
+        avg = sum(sequence) / len(sequence)
+        sdsq = sum([(i - avg) ** 2 for i in sequence])
+        stdev = (sdsq / (len(sequence) - 1)) ** .5
+        return stdev
 
 class RedisCacheTests(unittest.TestCase):
     """
@@ -33,25 +43,8 @@ class RedisCacheTests(unittest.TestCase):
         self.cache.close()
 
     def get_cache(self, backend=None):
-        if VERSION[0] == 1 and VERSION[1] < 3:
-            cache = get_cache(backend or 'redis_cache.cache://127.0.0.1:6379?db=15')
-        elif VERSION[0] == 1 and VERSION[1] >= 3:
-            cache = get_cache(backend or 'default')
+        cache = get_cache(backend or 'default')
         return cache
-
-    def test_bad_db_initialization(self):
-        self.cache = self.get_cache('redis_cache.cache://127.0.0.1:6379?db=not_a_number')
-        self.assertEqual(self.cache._cache.db, 1)
-
-    def test_bad_port_initialization(self):
-        self.cache = self.get_cache('redis_cache.cache://127.0.0.1:not_a_number?db=15')
-        self.assertEqual(self.cache._cache.port, 6379)
-
-    def test_default_initialization(self):
-        self.cache = self.get_cache('redis_cache.cache://127.0.0.1')
-        self.assertEqual(self.cache._cache.host, '127.0.0.1')
-        self.assertEqual(self.cache._cache.db, 1)
-        self.assertEqual(self.cache._cache.port, 6379)
 
     def test_simple(self):
         # Simple cache set/get works
@@ -191,20 +184,20 @@ class RedisCacheTests(unittest.TestCase):
     def test_set_expiration_timeout_None(self):
         key, value = self.cache.make_key('key'), 'value'
         self.cache.set(key, value);
-        self.assertTrue(self.cache._cache.ttl(key) > 0)
+        self.assertTrue(self.cache.get_cache(key).ttl(key) > 0)
 
     def test_set_expiration_timeout_0(self):
         key, value = self.cache.make_key('key'), 'value'
         self.cache.set(key, value)
-        self.assertTrue(self.cache._cache.ttl(key) > 0)
+        self.assertTrue(self.cache.get_cache(key).ttl(key) > 0)
         self.cache.expire(key, 0)
         self.assertEqual(self.cache.get(key), value)
-        self.assertTrue(self.cache._cache.ttl(key) < 0)
+        self.assertTrue(self.cache.get_cache(key).ttl(key) < 0)
 
     def test_set_expiration_first_expire_call(self):
         key, value = self.cache.make_key('key'), 'value'
         # bypass public set api so we don't set the expiration
-        self.cache._cache.set(key, pickle.dumps(value))
+        self.cache.get_cache(key).set(key, pickle.dumps(value))
         self.cache.expire('key', 1)
         time.sleep(2)
         self.assertEqual(self.cache.get('key'), None)
@@ -292,17 +285,30 @@ class RedisCacheTests(unittest.TestCase):
         self.assertEqual(self.cache.get('key4'), 'lobster bisque')
 
     def test_incr_version(self):
-        if isinstance(self.cache, RedisCache):
-            old_key = "key1"
-            self.cache.set(old_key, "spam", version=1)
-            self.assertEqual(self.cache.make_key(old_key), ':1:key1')
-            new_version = self.cache.incr_version(old_key, 1)
-            self.assertEqual(new_version, 2)
-            new_key = self.cache.make_key(old_key, version=new_version)
-            self.assertEqual(new_key, ':2:key1')
-            self.assertEqual(self.cache.get(old_key), None)
-            self.assertEqual(self.cache.get(new_key), 'spam')
+        old_key = "key1"
+        self.cache.set(old_key, "spam", version=1)
+        self.assertEqual(self.cache.make_key(old_key), ':1:key1')
+        new_version = self.cache.incr_version(old_key, 1)
+        self.assertEqual(new_version, 2)
+        new_key = self.cache.make_key(old_key, version=new_version)
+        self.assertEqual(new_key, ':2:key1')
+        self.assertEqual(self.cache.get(old_key), None)
+        self.assertEqual(self.cache.get(new_key), 'spam')
 
+    def test_normalized_distribution(self):
+        """
+        Testing whether keys are evenly distributed over the caches.  Basically,
+        I'm testing to see if the standard deviation divided by the number of
+        samples is less than %5.
+        """
+        r = {}
+        num_samples = 10000
+        for i in range(num_samples):
+            r[str(random())] = i
+        self.cache.set_many(r)
+        keys_per_cache = [len(node._node.keys()) for node in self.cache.sharder._nodes]
+        sd = stdev(keys_per_cache)
+        self.assertTrue(sd / num_samples < .05)
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,6 +1,8 @@
+from collections import defaultdict
 from django.core.cache.backends.base import BaseCache, InvalidCacheBackendError
 from django.utils.encoding import smart_unicode, smart_str
 from django.utils.datastructures import SortedDict
+from sharder import CacheSharder
 
 try:
     import cPickle as pickle
@@ -24,6 +26,9 @@ class CacheKey(object):
     def __eq__(self, other):
         return self._key == other
 
+    def __repr__(self):
+        return self.__unicode__()
+
     def __str__(self):
         return self.__unicode__()
 
@@ -31,12 +36,13 @@ class CacheKey(object):
         return smart_str(self._key)
 
 
-class CacheClass(BaseCache):
+class RedisCache(BaseCache):
     def __init__(self, server, params):
         """
         Connect to Redis, and set up cache backend.
         """
-        super(CacheClass, self).__init__(params)
+        super(RedisCache, self).__init__(params)
+        self.sharder = CacheSharder()
         options = params.get('OPTIONS', {})
         password = params.get('password', options.get('PASSWORD', None))
         db = params.get('db', options.get('DB', 1))
@@ -44,36 +50,42 @@ class CacheClass(BaseCache):
             db = int(db)
         except (ValueError, TypeError):
             db = 1
-        if ':' in server:
-            host, port = server.split(':')
-            try:
-                port = int(port)
-            except (ValueError, TypeError):
-                port = 6379
+        if isinstance(server, basestring):
+            self._servers = server.split(';')
         else:
-            host = server or 'localhost'
+            self._servers = server or ['localhost']
+        for host in self._servers:
             port = 6379
-        self._cache = redis.Redis(host=host, port=port, db=db, password=password)
+            if ':' in host:
+                host, port = host.split(':')
+                try:
+                    port = int(port)
+                except (ValueError, TypeError):
+                    port = 6379
+            client = redis.Redis(host=host, port=port, db=db, password=password)
+            self.sharder.add(client, ":".join([host, str(port)]))
+
+    def get_cache(self, key):
+        return self.sharder.get_node(key)
+
+    def get_caches(self, keys, version=None):
+        """
+        Returns a dict of keys that belong to a cache's keyspace.
+        """
+        caches = defaultdict(list)
+        keys = map(lambda key: self.make_key(key, version=version), keys)
+        for key in keys:
+            caches[self.get_cache(key)].append(key)
+        return caches
+
+    @property
+    def caches(self):
+        return self.sharder._nodes
 
     def make_key(self, key, version=None):
-        """
-        Returns the utf-8 encoded bytestring of the given key as a CacheKey
-        instance to be able to check if it was "made" before.
-        """
         if not isinstance(key, CacheKey):
-            key = CacheKey(key)
+            key = CacheKey(super(RedisCache, self).make_key(key, version))
         return key
-
-    def add(self, key, value, timeout=None, version=None):
-        """
-        Add a value to the cache, failing if the key already exists.
-
-        Returns ``True`` if the object was added, ``False`` if not.
-        """
-        key = self.make_key(key, version=version)
-        if self._cache.exists(key):
-            return False
-        return self.set(key, value, timeout)
 
     def get(self, key, default=None, version=None):
         """
@@ -82,22 +94,66 @@ class CacheClass(BaseCache):
         Returns unpickled value if key is found, the default if not.
         """
         key = self.make_key(key, version=version)
-        value = self._cache.get(key)
+        value = self.get_cache(key).get(key)
         if value is None:
             return default
         return self.unpickle(value)
+
+    def get_many(self, keys, version=None):
+        """
+        Retrieve many keys.
+        """
+        recovered_data = SortedDict()
+        new_keys = map(lambda key: self.make_key(key, version=version), keys)
+        map_keys = dict(zip(new_keys, keys))
+        caches = self.get_caches(new_keys)
+        for cache, keys in caches.items():
+            values = cache.mget(keys)
+            for key, value in zip(keys, values):
+                if value is None:
+                    continue
+                value = self.unpickle(value)
+                if isinstance(value, basestring):
+                    value = smart_unicode(value)
+                recovered_data[map_keys[key]] = value
+        return recovered_data
+
+    def add(self, key, value, timeout=None, version=None):
+        """
+        Add a value to the cache, failing if the key already exists.
+
+        Returns ``True`` if the object was added, ``False`` if not.
+        """
+        key = self.make_key(key, version=version)
+        if self.get_cache(key).exists(key):
+            return False
+        return self.set(key, value, timeout)
 
     def set(self, key, value, timeout=None, version=None):
         """
         Persist a value to the cache, and set an optional expiration time.
         """
         key = self.make_key(key, version=version)
-        # store the pickled value
-        result = self._cache.set(key, pickle.dumps(value))
-        # set expiration if needed
+        result = self.get_cache(key).set(key, pickle.dumps(value))
         self.expire(key, timeout, version=version)
-        # result is a boolean
         return result
+
+    def set_many(self, data, timeout=None, version=None):
+        """
+        Set a bunch of values in the cache at once from a dict of key/value
+        pairs. This is much more efficient than calling set() multiple times.
+
+        If timeout is given, that timeout will be used for the key; otherwise
+        the default cache timeout will be used.
+        """
+        caches = defaultdict(dict)
+        for key, value in data.iteritems():
+            cache_key = self.make_key(key, version=version)
+            caches[self.get_cache(cache_key)][cache_key] = pickle.dumps(value)
+        if caches:
+            for cache, safe_data in caches.items():
+                cache.mset(safe_data)
+                map(self.expire, safe_data.keys(), [timeout]*len(safe_data))
 
     def expire(self, key, timeout=None, version=None):
         """
@@ -108,12 +164,12 @@ class CacheClass(BaseCache):
             timeout = self.default_timeout
         if timeout <= 0:
             # force the key to be non-volatile
-            result = self._cache.get(key)
-            self._cache.set(key, result)
+            result = self.get_cache(key).get(key)
+            self.get_cache(key).set(key, result)
         else:
             # If the expiration command returns false, we need to reset the key
             # with the new expiration
-            if not self._cache.expire(key, timeout):
+            if not self.get_cache(key).expire(key, timeout):
                 value = self.get(key, version=version)
                 self.set(key, value, timeout, version=version)
 
@@ -121,22 +177,24 @@ class CacheClass(BaseCache):
         """
         Remove a key from the cache.
         """
-        self._cache.delete(self.make_key(key, version=version))
+        self.get_cache(key).delete(self.make_key(key, version=version))
 
     def delete_many(self, keys, version=None):
         """
         Remove multiple keys at once.
         """
         if keys:
-            keys = map(lambda key: self.make_key(key, version=version), keys)
-            self._cache.delete(*keys)
+            caches = self.get_caches(keys, version)
+            for cache, keys in caches.iteritems():
+                cache.delete(*keys)
 
     def clear(self):
         """
         Flush all cache keys.
         """
         # TODO : potential data loss here, should we only delete keys based on the correct version ?
-        self._cache.flushdb()
+        for cache in self.caches:
+            cache._node.flushdb()
 
     def unpickle(self, value):
         """
@@ -144,55 +202,6 @@ class CacheClass(BaseCache):
         """
         value = smart_str(value)
         return pickle.loads(value)
-
-    def get_many(self, keys, version=None):
-        """
-        Retrieve many keys.
-        """
-        recovered_data = SortedDict()
-        new_keys = map(lambda key: self.make_key(key, version=version), keys)
-        map_keys = dict(zip(new_keys, keys))
-        results = self._cache.mget(new_keys)
-        for key, value in zip(new_keys, results):
-            if value is None:
-                continue
-            value = self.unpickle(value)
-            if isinstance(value, basestring):
-                value = smart_unicode(value)
-            recovered_data[map_keys[key]] = value
-        return recovered_data
-
-    def set_many(self, data, timeout=None, version=None):
-        """
-        Set a bunch of values in the cache at once from a dict of key/value
-        pairs. This is much more efficient than calling set() multiple times.
-
-        If timeout is given, that timeout will be used for the key; otherwise
-        the default cache timeout will be used.
-        """
-        safe_data = {}
-        for key, value in data.iteritems():
-            safe_data[key] = pickle.dumps(value)
-        if safe_data:
-            self._cache.mset(dict((self.make_key(key, version=version), value)
-                                   for key, value in safe_data.iteritems()))
-            map(self.expire, safe_data, [timeout]*len(safe_data))
-
-    def close(self, **kwargs):
-        """
-        Disconnect from the cache.
-        """
-        self._cache.connection.disconnect()
-
-class RedisCache(CacheClass):
-    """
-    A subclass that is supposed to be used on Django >= 1.3.
-    """
-
-    def make_key(self, key, version=None):
-        if not isinstance(key, CacheKey):
-            key = CacheKey(super(CacheClass, self).make_key(key, version))
-        return key
 
     def incr_version(self, key, delta=1, version=None):
         """
@@ -206,7 +215,7 @@ class RedisCache(CacheClass):
             version = self.version
         old_key = self.make_key(key, version)
         value = self.get(old_key, version=version)
-        ttl = self._cache.ttl(old_key)
+        ttl = self.get_cache(key).ttl(old_key)
         if value is None:
             raise ValueError("Key '%s' not found" % key)
         new_key = self.make_key(key, version=version+delta)
@@ -215,3 +224,10 @@ class RedisCache(CacheClass):
         self.set(new_key, value, timeout=ttl)
         self.delete(old_key)
         return version + delta
+
+    def close(self, **kwargs):
+        """
+        Disconnect from the cache.
+        """
+        for cache in self.caches:
+            cache._node.connection.disconnect()
