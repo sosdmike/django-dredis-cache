@@ -230,4 +230,8 @@ class RedisCache(BaseCache):
         Disconnect from the cache.
         """
         for cache in self.caches:
-            cache._node.connection.disconnect()
+            node = cache._node
+            if hasattr(node, 'connection_pool'):
+                cache._node.connection_pool.disconnect()
+            else:
+                cache._node.connection.disconnect()
