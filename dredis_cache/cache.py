@@ -201,7 +201,10 @@ class RedisCache(BaseCache):
         Unpickles the given value.
         """
         value = smart_str(value)
-        return pickle.loads(value)
+        try:
+            return pickle.loads(value)
+        except pickle.UnpicklingError:
+            return value
 
     def incr_version(self, key, delta=1, version=None):
         """
@@ -230,8 +233,4 @@ class RedisCache(BaseCache):
         Disconnect from the cache.
         """
         for cache in self.caches:
-            node = cache._node
-            if hasattr(node, 'connection_pool'):
-                cache._node.connection_pool.disconnect()
-            else:
-                cache._node.connection.disconnect()
+            cache._node.connection.disconnect()
