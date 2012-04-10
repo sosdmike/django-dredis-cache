@@ -200,11 +200,12 @@ class RedisCache(BaseCache):
         """
         Unpickles the given value.
         """
+        old = value
         value = smart_str(value)
         try:
             return pickle.loads(value)
         except pickle.UnpicklingError:
-            return value
+            return old
 
     def incr_version(self, key, delta=1, version=None):
         """
